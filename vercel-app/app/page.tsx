@@ -28,6 +28,7 @@ type Room = {
   rivalScore: Score | null;
   rival: { name: string; rating: number };
   rating: number;
+  record: { wins: number; losses: number };
 };
 
 type ArenaSignal = {
@@ -43,15 +44,8 @@ type Leader = {
   rating: number;
   wins: number;
   losses: number;
+  is_you?: number;
 };
-
-const showcaseLeaders = [
-  { name: "Sir Barksalot", rating: 1842, wins: 94, losses: 21 },
-  { name: "Luna", rating: 1796, wins: 81, losses: 19 },
-  { name: "Cheddar", rating: 1731, wins: 77, losses: 26 },
-  { name: "Tofu", rating: 1689, wins: 69, losses: 24 },
-  { name: "Biggie Paws", rating: 1654, wins: 62, losses: 28 },
-];
 
 const dogFaces = ["🐕‍🦺", "🐺", "🦮", "🐶", "🐕", "🐩", "🐾"];
 const clamp = (value: number, min: number, max: number) =>
@@ -116,7 +110,7 @@ export default function Home() {
   const [record, setRecord] = useState({ wins: 0, losses: 0 });
   const [displayName, setDisplayName] = useState("Anonymous Pup");
   const [playerId, setPlayerId] = useState("");
-  const [leaders, setLeaders] = useState<Leader[]>(showcaseLeaders);
+  const [leaders, setLeaders] = useState<Leader[]>([]);
 
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
@@ -136,8 +130,9 @@ export default function Home() {
   const lastSignalIdRef = useRef(0);
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const scheduledStartRef = useRef<number | null>(null);
-  const resultRecordedRef = useRef(false);
   const reconnectAttemptRef = useRef(false);
+  const lifecycleRef = useRef(0);
+  const pollGenerationRef = useRef(0);
 
   const prompt = prompts[room?.promptIndex ?? 0];
   const rival = room?.rival ?? { name: "Mystery Pup", rating: 1200 };
@@ -155,24 +150,43 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    const savedId = window.localStorage.getItem("barkoff-player-id");
+    const savedId =
+      window.localStorage.getItem("barkoff-device-id") ??
+      window.localStorage.getItem("barkoff-player-id");
     const savedName = window.localStorage.getItem("barkoff-name");
-    const savedProfile = window.localStorage.getItem("barkoff-profile");
     const nextId = savedId || crypto.randomUUID();
+    window.localStorage.setItem("barkoff-device-id", nextId);
     window.localStorage.setItem("barkoff-player-id", nextId);
     const profileTimer = window.setTimeout(() => {
       setPlayerId(nextId);
       if (savedName) setDisplayName(savedName);
-      if (savedProfile) {
-        try {
-          const profile = JSON.parse(savedProfile) as { rating?: number; wins?: number; losses?: number };
-          setRating(profile.rating ?? 1200);
-          setRecord({ wins: profile.wins ?? 0, losses: profile.losses ?? 0 });
-        } catch {
-          // Keep a clean local profile.
-        }
-      }
     }, 0);
+
+    let cancelled = false;
+    fetch(`/api/arena?action=profile&playerId=${encodeURIComponent(nextId)}`, {
+      cache: "no-store",
+    })
+      .then((result) => result.json())
+      .then(
+        (payload: {
+          profile?: {
+            name: string;
+            rating: number;
+            wins: number;
+            losses: number;
+          } | null;
+        }) => {
+          if (cancelled || !payload.profile) return;
+          setDisplayName(payload.profile.name);
+          setRating(payload.profile.rating);
+          setRecord({
+            wins: payload.profile.wins,
+            losses: payload.profile.losses,
+          });
+          window.localStorage.setItem("barkoff-name", payload.profile.name);
+        },
+      )
+      .catch(() => undefined);
 
     const beforeUnload = () => {
       const activeRoom = roomRef.current;
@@ -185,6 +199,7 @@ export default function Home() {
     };
     window.addEventListener("beforeunload", beforeUnload);
     return () => {
+      cancelled = true;
       window.clearTimeout(profileTimer);
       window.removeEventListener("beforeunload", beforeUnload);
     };
@@ -203,22 +218,24 @@ export default function Home() {
   useEffect(() => {
     if (stage !== "leaderboard") return;
     let cancelled = false;
-    fetch("/api/arena?action=leaderboard", { cache: "no-store" })
+    const params = new URLSearchParams({ action: "leaderboard" });
+    if (playerId) params.set("playerId", playerId);
+    fetch(`/api/arena?${params}`, { cache: "no-store" })
       .then((result) => result.json())
       .then((payload: { players?: Leader[] }) => {
-        if (!cancelled && payload.players?.length) setLeaders(payload.players);
+        if (!cancelled) setLeaders(payload.players ?? []);
       })
       .catch(() => undefined);
     return () => {
       cancelled = true;
     };
-  }, [stage]);
+  }, [stage, playerId]);
 
   const clearRoundTimers = useCallback(() => {
-    if (animationRef.current) cancelAnimationFrame(animationRef.current);
-    if (timerRef.current) clearInterval(timerRef.current);
-    if (startTimeoutRef.current) clearTimeout(startTimeoutRef.current);
-    if (countdownRef.current) clearInterval(countdownRef.current);
+    if (animationRef.current !== null) cancelAnimationFrame(animationRef.current);
+    if (timerRef.current !== null) clearInterval(timerRef.current);
+    if (startTimeoutRef.current !== null) clearTimeout(startTimeoutRef.current);
+    if (countdownRef.current !== null) clearInterval(countdownRef.current);
     animationRef.current = null;
     timerRef.current = null;
     startTimeoutRef.current = null;
@@ -226,8 +243,15 @@ export default function Home() {
   }, []);
 
   const closePeer = useCallback(() => {
+    lifecycleRef.current += 1;
     clearRoundTimers();
-    peerRef.current?.close();
+    const peer = peerRef.current;
+    if (peer) {
+      peer.onicecandidate = null;
+      peer.ontrack = null;
+      peer.onconnectionstatechange = null;
+      peer.close();
+    }
     peerRef.current = null;
     remoteStreamRef.current?.getTracks().forEach((track) => track.stop());
     remoteStreamRef.current = null;
@@ -291,6 +315,10 @@ export default function Home() {
   const createPeer = useCallback(
     async (activeRoom: Room) => {
       if (peerRef.current || !streamRef.current) return peerRef.current;
+      const lifecycle = lifecycleRef.current;
+      const isCurrentRoom = () =>
+        lifecycleRef.current === lifecycle &&
+        roomRef.current?.id === activeRoom.id;
       setConnectionState("connecting");
       setArenaNote("Opening a secure peer-to-peer tunnel...");
       let iceServers: RTCIceServer[] = [
@@ -317,6 +345,7 @@ export default function Home() {
       } catch {
         // Direct STUN negotiation remains available.
       }
+      if (!isCurrentRoom() || !streamRef.current) return null;
       const peer = new RTCPeerConnection({
         iceServers,
         iceCandidatePoolSize: 10,
@@ -339,13 +368,14 @@ export default function Home() {
       }
 
       peer.onicecandidate = (event) => {
-        if (!event.candidate) return;
+        if (!event.candidate || peerRef.current !== peer || !isCurrentRoom()) return;
         void sendSignal(activeRoom, {
           type: "candidate",
           candidate: event.candidate.toJSON(),
         }).catch(() => setArenaNote("Reconnecting signaling..."));
       };
       peer.ontrack = (event) => {
+        if (peerRef.current !== peer || !isCurrentRoom()) return;
         const stream = event.streams[0] ?? new MediaStream([event.track]);
         remoteStreamRef.current = stream;
         setRemoteVideo(true);
@@ -355,6 +385,7 @@ export default function Home() {
         }
       };
       peer.onconnectionstatechange = () => {
+        if (peerRef.current !== peer || !isCurrentRoom()) return;
         if (peer.connectionState === "connected") {
           setConnectionState("connected");
           setArenaNote("Live peer-to-peer connection · End-to-end encrypted");
@@ -379,7 +410,9 @@ export default function Home() {
 
       if (activeRoom.role === "offerer") {
         const offer = await peer.createOffer();
+        if (!isCurrentRoom() || peerRef.current !== peer) return null;
         await peer.setLocalDescription(offer);
+        if (!isCurrentRoom() || peerRef.current !== peer) return null;
         await sendSignal(activeRoom, { type: offer.type, sdp: offer.sdp ?? "" });
       }
       return peer;
@@ -389,9 +422,11 @@ export default function Home() {
 
   const handleSignals = useCallback(
     async (activeRoom: Room, signals: ArenaSignal[]) => {
+      if (roomRef.current?.id !== activeRoom.id) return;
       const peer = (await createPeer(activeRoom)) ?? peerRef.current;
-      if (!peer) return;
+      if (!peer || roomRef.current?.id !== activeRoom.id) return;
       for (const item of signals) {
+        if (peerRef.current !== peer || roomRef.current?.id !== activeRoom.id) return;
         lastSignalIdRef.current = Math.max(lastSignalIdRef.current, item.id);
         const signal = item.payload;
         if (!signal) continue;
@@ -548,6 +583,12 @@ export default function Home() {
     if ((stage !== "matching" && stage !== "battle") || !playerId) return;
     let cancelled = false;
     let pollTimer: ReturnType<typeof setTimeout> | null = null;
+    const lifecycle = lifecycleRef.current;
+    const pollGeneration = ++pollGenerationRef.current;
+    const isCurrentPoll = () =>
+      !cancelled &&
+      lifecycleRef.current === lifecycle &&
+      pollGenerationRef.current === pollGeneration;
     const poll = async () => {
       try {
         const params = new URLSearchParams({
@@ -557,54 +598,55 @@ export default function Home() {
         if (roomRef.current) params.set("roomId", roomRef.current.id);
         const result = await fetch(`/api/arena?${params}`, { cache: "no-store" });
         const payload = await result.json();
+        if (!isCurrentPoll()) return;
         if (!result.ok) throw new Error(payload.error ?? "Matchmaking unavailable.");
 
         if (payload.state === "matched" && payload.room) {
           const nextRoom = payload.room as Room;
+          if (nextRoom.status === "abandoned") {
+            setError(`${nextRoom.rival.name} left the arena. Find a new rival when you’re ready.`);
+            closePeer();
+            roomRef.current = null;
+            setRoom(null);
+            setCurrentStage("lobby");
+            return;
+          }
           roomRef.current = nextRoom;
           setRoom(nextRoom);
           setRating(nextRoom.rating);
+          setRecord(nextRoom.record);
           if (stageRef.current === "matching") {
             setCurrentStage("battle");
             setRoundPhase("connecting");
           }
           await handleSignals(nextRoom, (payload.signals ?? []) as ArenaSignal[]);
+          if (!isCurrentPoll()) return;
           if (nextRoom.startsAt) scheduleRound(nextRoom.startsAt);
-          if (nextRoom.status === "abandoned") {
-            setError(`${nextRoom.rival.name} left the arena. Find a new rival when you’re ready.`);
-            closePeer();
-            setCurrentStage("lobby");
-          } else if (nextRoom.score && nextRoom.rivalScore) {
+          if (nextRoom.score && nextRoom.rivalScore) {
             setScore(nextRoom.score);
             setRivalScore(nextRoom.rivalScore);
             setRating(nextRoom.rating);
-            if (!resultRecordedRef.current) {
-              resultRecordedRef.current = true;
-              setRecord((current) => {
-                const won = nextRoom.score!.total >= nextRoom.rivalScore!.total;
-                const updated = won
-                  ? { ...current, wins: current.wins + 1 }
-                  : { ...current, losses: current.losses + 1 };
-                window.localStorage.setItem(
-                  "barkoff-profile",
-                  JSON.stringify({ rating: nextRoom.rating, ...updated }),
-                );
-                return updated;
-              });
-            }
+            setRecord(nextRoom.record);
             closePeer();
             setCurrentStage("results");
           }
         }
-        setError("");
+        if (isCurrentPoll()) setError("");
       } catch (caught) {
-        setArenaNote(caught instanceof Error ? caught.message : "Reconnecting to the arena...");
+        if (isCurrentPoll()) {
+          setArenaNote(caught instanceof Error ? caught.message : "Reconnecting to the arena...");
+        }
       }
-      if (!cancelled) pollTimer = setTimeout(poll, stageRef.current === "matching" ? 900 : 520);
+      if (isCurrentPoll()) {
+        pollTimer = setTimeout(poll, stageRef.current === "matching" ? 900 : 520);
+      }
     };
     void poll();
     return () => {
       cancelled = true;
+      if (pollGenerationRef.current === pollGeneration) {
+        pollGenerationRef.current += 1;
+      }
       if (pollTimer) clearTimeout(pollTimer);
     };
   }, [
@@ -616,6 +658,35 @@ export default function Home() {
     setCurrentStage,
   ]);
 
+  const saveProfileName = useCallback(async () => {
+    const name = displayName.trim() || "Anonymous Pup";
+    setDisplayName(name);
+    window.localStorage.setItem("barkoff-name", name);
+    if (!playerId) return;
+    try {
+      const payload = (await arenaPost({
+        action: "profile",
+        playerId,
+        name,
+      })) as {
+        profile?: {
+          name: string;
+          rating: number;
+          wins: number;
+          losses: number;
+        };
+      };
+      if (!payload.profile) return;
+      setRating(payload.profile.rating);
+      setRecord({
+        wins: payload.profile.wins,
+        losses: payload.profile.losses,
+      });
+    } catch {
+      // Match entry retries the same profile update.
+    }
+  }, [displayName, playerId]);
+
   const enterArena = async () => {
     setError("");
     if (!playerId) return;
@@ -624,13 +695,13 @@ export default function Home() {
       setError("Allow microphone access to join a real online bark-off.");
       return;
     }
-    window.localStorage.setItem("barkoff-name", displayName.trim() || "Anonymous Pup");
+    await saveProfileName();
     closePeer();
+    const lifecycle = lifecycleRef.current;
     setRoom(null);
     roomRef.current = null;
     setScore(null);
     setRivalScore(null);
-    resultRecordedRef.current = false;
     lastSignalIdRef.current = 0;
     setArenaNote("Sniffing for a live rival...");
     setCurrentStage("matching");
@@ -641,14 +712,18 @@ export default function Home() {
         name: displayName,
         rating,
       });
+      if (lifecycleRef.current !== lifecycle || stageRef.current !== "matching") return;
       if (payload.state === "matched" && payload.room) {
         const matchedRoom = payload.room as Room;
         roomRef.current = matchedRoom;
         setRoom(matchedRoom);
+        setRating(matchedRoom.rating);
+        setRecord(matchedRoom.record);
         setCurrentStage("battle");
         await handleSignals(matchedRoom, (payload.signals ?? []) as ArenaSignal[]);
       }
     } catch (caught) {
+      if (lifecycleRef.current !== lifecycle) return;
       setError(caught instanceof Error ? caught.message : "Could not enter the arena.");
       setCurrentStage("lobby");
     }
@@ -681,17 +756,17 @@ export default function Home() {
   const leaveArena = useCallback(
     async (showLobby = true) => {
       const activeRoom = roomRef.current;
+      closePeer();
+      roomRef.current = null;
+      setRoom(null);
+      if (showLobby) setCurrentStage("lobby");
       if (activeRoom) {
-        void arenaPost({
+        await arenaPost({
           action: "leave",
           playerId,
           roomId: activeRoom.id,
         }).catch(() => undefined);
       }
-      closePeer();
-      roomRef.current = null;
-      setRoom(null);
-      if (showLobby) setCurrentStage("lobby");
     },
     [closePeer, playerId, setCurrentStage],
   );
@@ -763,6 +838,7 @@ export default function Home() {
                 <input
                   value={displayName}
                   onChange={(event) => setDisplayName(event.target.value.slice(0, 24))}
+                  onBlur={() => void saveProfileName()}
                   maxLength={24}
                   autoComplete="nickname"
                   aria-label="Your Barkoff name"
@@ -988,14 +1064,24 @@ export default function Home() {
           <div className="leaderboard-table">
             <div className="leaderboard-row table-head"><span>RANK</span><span>PUP</span><span>RECORD</span><span>ELO</span></div>
             {leaders.map((dog, index) => (
-              <div className="leaderboard-row" key={`${dog.name}-${index}`}>
+              <div
+                className={`leaderboard-row ${dog.is_you ? "you-row" : ""}`}
+                key={`${dog.name}-${index}`}
+              >
                 <span className={`rank rank--${index + 1}`}>{index + 1}</span>
                 <span className="leader-dog"><i>{dogFaces[index % dogFaces.length]}</i><b>{dog.name}<small>GLOBAL COMPETITOR</small></b></span>
                 <span className="record-copy">{dog.wins}W · {dog.losses}L</span>
                 <span className="elo"><b>{dog.rating}</b><small>LIVE</small></span>
               </div>
             ))}
-            {!leaders.some((leader) => leader.name === displayName) && (
+            {leaders.length === 0 && (
+              <div className="empty-board">
+                <span>🐾</span>
+                <strong>THE PACK IS WIDE OPEN</strong>
+                <p>Complete the first live bark-off to claim the top spot.</p>
+              </div>
+            )}
+            {!leaders.some((leader) => leader.is_you) && (
               <div className="leaderboard-row you-row">
                 <span className="rank">—</span>
                 <span className="leader-dog"><i>🐶</i><b>{displayName || "You"}<small>READY TO COMPETE</small></b></span>

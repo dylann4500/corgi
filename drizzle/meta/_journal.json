@@ -15,6 +15,13 @@
       "when": 1785044768856,
       "tag": "0001_past_hammerhead",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1785049192709,
+      "tag": "0002_reset_leaderboard",
+      "breakpoints": true
     }
   ]
 }

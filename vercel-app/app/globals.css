@@ -16,10 +16,13 @@
 
 html {
   scroll-behavior: smooth;
+  overflow-x: hidden;
+  -webkit-text-size-adjust: 100%;
 }
 
 body {
   margin: 0;
+  overflow-x: hidden;
   background: var(--cream);
   color: var(--ink);
   font-family: Arial, Helvetica, sans-serif;
@@ -28,6 +31,7 @@ body {
 button {
   color: inherit;
   font: inherit;
+  touch-action: manipulation;
 }
 
 button:focus-visible {
@@ -37,6 +41,7 @@ button:focus-visible {
 
 .app-shell {
   min-height: 100vh;
+  min-height: 100dvh;
   overflow: hidden;
   background:
     radial-gradient(circle at 15% 18%, rgba(255, 255, 255, .84), transparent 24rem),
@@ -1371,6 +1376,21 @@ nav button.nav-active {
 .elo small { padding: 4px 6px; color: #27894b; background: #d8f2df; font-size: 8px; font-weight: 1000; }
 
 .you-row { background: var(--lime); outline: 2px solid var(--ink); }
+
+.empty-board {
+  min-height: 180px;
+  padding: 34px 20px;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 8px;
+  text-align: center;
+}
+
+.empty-board span { font-size: 42px; }
+.empty-board strong { font-size: 17px; letter-spacing: .7px; }
+.empty-board p { margin: 0; font-family: Georgia, serif; font-size: 13px; opacity: .68; }
+
 .board-footnote { text-align: center; margin-top: 22px; font-family: Georgia, serif; font-size: 13px; }
 
 footer {
@@ -1390,8 +1410,8 @@ footer {
 footer b { color: var(--orange); }
 
 @media (max-width: 900px) {
-  .topbar { grid-template-columns: 1fr auto; }
-  nav { display: none; }
+  .topbar { grid-template-columns: 1fr auto auto; gap: 14px; }
+  nav button { padding: 9px 12px; font-size: 9px; }
   .hero-grid { grid-template-columns: 1fr; padding: 60px 0; }
   .hero-copy { text-align: center; }
   .hero-sub { margin: 0 auto; }
@@ -1418,16 +1438,24 @@ footer b { color: var(--orange); }
   .battle-screen,
   .results-screen,
   .leaderboard-screen { width: min(100% - 24px, 1240px); }
-  .topbar { height: 72px; }
+  .topbar {
+    height: auto;
+    min-height: 72px;
+    padding-top: max(8px, env(safe-area-inset-top));
+    grid-template-columns: 1fr auto;
+    gap: 8px;
+  }
   .brand { font-size: 20px; }
   .paw-mark { transform: scale(.86); }
-  .profile-copy { display: none; }
-  .profile-dog { width: 38px; height: 38px; }
+  .profile-pill { display: none; }
+  nav { padding: 3px; }
+  nav button { min-height: 40px; padding: 8px 9px; font-size: 8px; letter-spacing: .55px; }
   .lobby { padding-top: 25px; }
   .hero-grid { min-height: 0; padding: 48px 0 55px; gap: 55px; }
   .hero-copy h1 { font-size: 58px; letter-spacing: -4px; }
   .hero-copy h1 em { text-shadow: 2px 2px 0 var(--ink); }
   .hero-sub { font-size: 17px; }
+  .name-field input { font-size: 16px; }
   .hero-actions { flex-direction: column; }
   .arena-preview { min-height: 360px; box-shadow: 7px 7px 0 var(--ink); }
   .dog-portrait { width: 125px; height: 150px; font-size: 75px; }
@@ -1440,16 +1468,44 @@ footer b { color: var(--orange); }
   .stats-strip > div { min-height: 82px; border-bottom: 1px solid rgba(23,23,23,.25); }
   .stats-strip strong { font-size: 30px; }
   .hackathon-ribbon { white-space: nowrap; }
-  .battle-heading { grid-template-columns: 1fr auto; }
+  .battle-heading { grid-template-columns: 1fr auto; gap: 8px; }
+  .battle-heading p { font-size: 7px; }
   .judge-chip { display: none; }
   .timer { width: 70px; height: 70px; }
   .timer span { font-size: 30px; }
-  .prompt-card { padding: 14px; gap: 12px; }
+  .prompt-card { padding: 12px; gap: 10px; }
   .prompt-emoji { width: 56px; height: 56px; font-size: 31px; }
   .prompt-card h2 { font-size: 25px; }
-  .video-frame { height: 240px; }
+  .prompt-card p { font-size: 10px; }
+  .judge-brief { display: none; }
+  .battle-grid {
+    position: relative;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+    align-items: stretch;
+  }
+  .battle-vs { display: none; }
+  .player-card { min-width: 0; }
+  .video-frame { height: clamp(150px, 42vw, 220px); }
+  .video-fallback { font-size: 62px; }
+  .video-fallback small,
+  .remote-placeholder small { max-width: 90%; padding: 5px; font-size: 7px; }
+  .remote-placeholder > span { font-size: 58px; }
+  .player-tag { top: 7px; left: 7px; max-width: calc(100% - 14px); padding: 5px 6px; font-size: 6px; }
+  .live-chip,
+  .demo-chip { top: auto; right: 7px; bottom: 7px; padding: 5px 6px; font-size: 6px; }
+  .waveform { height: 44px; padding: 7px 8px; gap: 2px; }
+  .waveform span { width: 3px; }
+  .player-meta { min-height: 57px; padding: 9px; align-items: start; flex-direction: column; gap: 4px; }
+  .player-meta strong { max-width: 100%; overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+  .player-meta span { font-size: 6px; }
   .battle-screen { padding-top: 20px; }
-  .remote-placeholder > span { font-size: 82px; }
+  .record-panel { margin-top: 18px; padding-bottom: 18px; }
+  .bark-button,
+  .stop-button,
+  .judging-state,
+  .countdown-state { width: min(100%, 340px); min-width: 0; }
+  .record-panel > p { max-width: 330px; line-height: 1.5; }
   .result-actions { flex-direction: column; width: 100%; }
   .result-actions > * { width: 100%; min-height: 58px; }
   .results-screen h2 { font-size: 72px; letter-spacing: -5px; }
@@ -1467,7 +1523,28 @@ footer b { color: var(--orange); }
   .leader-dog b { font-size: 13px; }
   .elo b { font-size: 16px; }
   .elo small { display: none; }
-  footer { padding: 18px 12px; flex-direction: column; gap: 8px; }
+  footer {
+    padding: 18px 12px max(18px, env(safe-area-inset-bottom));
+    flex-direction: column;
+    gap: 8px;
+  }
+}
+
+@media (max-width: 380px) {
+  .topbar,
+  .lobby,
+  .battle-screen,
+  .results-screen,
+  .leaderboard-screen { width: min(100% - 16px, 1240px); }
+  .brand { gap: 5px; font-size: 18px; }
+  .brand .paw-mark { display: none; }
+  nav button { padding-inline: 7px; }
+  .hero-copy h1 { font-size: 49px; letter-spacing: -3px; }
+  .prompt-card h2 { font-size: 21px; }
+  .video-frame { height: 145px; }
+  .player-meta strong { font-size: 11px; }
+  .scoreboard { grid-template-columns: 1fr 30px 1fr; }
+  .result-avatar { width: 66px; height: 66px; font-size: 38px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

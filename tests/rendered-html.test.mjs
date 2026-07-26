@@ -61,3 +61,21 @@ test("ships prompt-aware audio judging instead of starter preview assets", async
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
   await assert.rejects(access(new URL("../app/_sites-preview", templateRoot)));
 });
+
+test("guards requeues and keeps one server-backed profile per browser", async () => {
+  const [page, arena, reset] = await Promise.all([
+    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/arena/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../drizzle/0002_reset_leaderboard.sql", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(page, /barkoff-device-id/);
+  assert.match(page, /action=profile/);
+  assert.match(page, /lifecycleRef/);
+  assert.match(page, /pollGenerationRef/);
+  assert.match(arena, /action === "profile"/);
+  assert.match(arena, /room_id = \?/);
+  assert.match(arena, /previousQueue\.status/);
+  assert.match(arena, /CASE WHEN id = \? THEN 1 ELSE 0 END AS is_you/);
+  assert.match(reset, /DELETE FROM `players`/);
+});

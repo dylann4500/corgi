@@ -23,6 +23,10 @@ type RoomRow = {
   player2_name: string;
   player1_rating: number;
   player2_rating: number;
+  player1_wins: number;
+  player2_wins: number;
+  player1_losses: number;
+  player2_losses: number;
   created_at: number;
 };
 
@@ -122,7 +126,11 @@ async function getRoom(roomId: string) {
       p1.name AS player1_name,
       p2.name AS player2_name,
       p1.rating AS player1_rating,
-      p2.rating AS player2_rating
+      p2.rating AS player2_rating,
+      p1.wins AS player1_wins,
+      p2.wins AS player2_wins,
+      p1.losses AS player1_losses,
+      p2.losses AS player2_losses
     FROM rooms r
     JOIN players p1 ON p1.id = r.player1_id
     JOIN players p2 ON p2.id = r.player2_id
@@ -150,6 +158,10 @@ function roomView(room: RoomRow, playerId: string) {
       rating: isPlayer1 ? room.player2_rating : room.player1_rating,
     },
     rating: isPlayer1 ? room.player1_rating : room.player2_rating,
+    record: {
+      wins: isPlayer1 ? room.player1_wins : room.player2_wins,
+      losses: isPlayer1 ? room.player1_losses : room.player2_losses,
+    },
   };
 }
 
@@ -343,10 +355,29 @@ export async function GET(request: Request) {
     }
 
     if (action === "leaderboard") {
+      const viewerId = url.searchParams.get("playerId");
+      const safeViewerId = validId(viewerId) ? viewerId : "";
       const rows = await db
-        .prepare("SELECT name, rating, wins, losses FROM players WHERE wins + losses > 0 ORDER BY rating DESC, wins DESC LIMIT 12")
-        .all<{ name: string; rating: number; wins: number; losses: number }>();
+        .prepare(`SELECT name, rating, wins, losses, CASE WHEN id = ? THEN 1 ELSE 0 END AS is_you
+          FROM players
+          WHERE wins + losses > 0
+          ORDER BY rating DESC, wins DESC
+          LIMIT 12`)
+        .bind(safeViewerId)
+        .all<{ name: string; rating: number; wins: number; losses: number; is_you: number }>();
       return response({ players: rows.results });
+    }
+
+    if (action === "profile") {
+      const playerId = url.searchParams.get("playerId");
+      if (!validId(playerId)) {
+        return response({ error: "Invalid player session." }, 400);
+      }
+      const profile = await db
+        .prepare("SELECT id, name, rating, wins, losses FROM players WHERE id = ?")
+        .bind(playerId)
+        .first<{ id: string; name: string; rating: number; wins: number; losses: number }>();
+      return response({ profile });
     }
 
     const playerId = url.searchParams.get("playerId");
@@ -371,12 +402,43 @@ export async function POST(request: Request) {
     const db = getD1();
     const now = Date.now();
 
+    if (action === "profile") {
+      const name = cleanName(payload.name);
+      await db
+        .prepare(`INSERT INTO players (id, name, rating, wins, losses, created_at, updated_at)
+          VALUES (?, ?, 1200, 0, 0, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at`)
+        .bind(playerId, name, now, now)
+        .run();
+      const profile = await db
+        .prepare("SELECT id, name, rating, wins, losses FROM players WHERE id = ?")
+        .bind(playerId)
+        .first<{ id: string; name: string; rating: number; wins: number; losses: number }>();
+      return response({ profile });
+    }
+
     if (action === "match") {
       const name = cleanName(payload.name);
       const startingRating = 1200;
+      const previousQueue = await db
+        .prepare(`SELECT q.room_id, r.status
+          FROM match_queue q
+          LEFT JOIN rooms r ON r.id = q.room_id
+          WHERE q.player_id = ?`)
+        .bind(playerId)
+        .first<{ room_id: string | null; status: string | null }>();
+      if (
+        previousQueue?.room_id &&
+        previousQueue.status &&
+        !["complete", "abandoned"].includes(previousQueue.status)
+      ) {
+        return response(await pollRoom(playerId, previousQueue.room_id, 0));
+      }
+
       await db.batch([
         db.prepare("DELETE FROM signals WHERE created_at < ?").bind(now - 10 * 60_000),
         db.prepare("DELETE FROM match_queue WHERE last_seen < ? AND room_id IS NULL").bind(now - 60_000),
+        db.prepare("DELETE FROM match_queue WHERE player_id = ?").bind(playerId),
         db.prepare(`INSERT INTO players (id, name, rating, wins, losses, created_at, updated_at)
           VALUES (?, ?, ?, 0, 0, ?, ?)
           ON CONFLICT(id) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at`)
@@ -390,7 +452,12 @@ export async function POST(request: Request) {
       await db
         .prepare(`INSERT INTO match_queue (player_id, name, rating, joined_at, last_seen, room_id)
           VALUES (?, ?, ?, ?, ?, NULL)
-          ON CONFLICT(player_id) DO UPDATE SET name = excluded.name, rating = excluded.rating, last_seen = excluded.last_seen`)
+          ON CONFLICT(player_id) DO UPDATE SET
+            name = excluded.name,
+            rating = excluded.rating,
+            joined_at = excluded.joined_at,
+            last_seen = excluded.last_seen,
+            room_id = NULL`)
         .bind(playerId, name, rating, now, now)
         .run();
 
@@ -482,7 +549,7 @@ export async function POST(request: Request) {
 
     if (action === "leave") {
       await db.batch([
-        db.prepare("DELETE FROM match_queue WHERE player_id = ?").bind(playerId),
+        db.prepare("DELETE FROM match_queue WHERE player_id = ? AND room_id = ?").bind(playerId, roomId),
         db.prepare("DELETE FROM signals WHERE room_id = ?").bind(roomId),
         db.prepare("UPDATE rooms SET status = CASE WHEN status = 'complete' THEN status ELSE 'abandoned' END, updated_at = ? WHERE id = ?")
           .bind(now, roomId),
