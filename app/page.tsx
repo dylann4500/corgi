@@ -190,9 +190,15 @@ export default function Home() {
 
     const beforeUnload = () => {
       const activeRoom = roomRef.current;
-      if (!activeRoom) return;
+      if (!activeRoom && stageRef.current !== "matching") return;
       const body = new Blob(
-        [JSON.stringify({ action: "leave", playerId: nextId, roomId: activeRoom.id })],
+        [
+          JSON.stringify(
+            activeRoom
+              ? { action: "leave", playerId: nextId, roomId: activeRoom.id }
+              : { action: "cancel", playerId: nextId },
+          ),
+        ],
         { type: "application/json" },
       );
       navigator.sendBeacon("/api/arena", body);
@@ -756,6 +762,7 @@ export default function Home() {
   const leaveArena = useCallback(
     async (showLobby = true) => {
       const activeRoom = roomRef.current;
+      const wasMatching = stageRef.current === "matching";
       closePeer();
       roomRef.current = null;
       setRoom(null);
@@ -765,6 +772,11 @@ export default function Home() {
           action: "leave",
           playerId,
           roomId: activeRoom.id,
+        }).catch(() => undefined);
+      } else if (wasMatching) {
+        await arenaPost({
+          action: "cancel",
+          playerId,
         }).catch(() => undefined);
       }
     },

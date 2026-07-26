@@ -417,6 +417,14 @@ export async function POST(request: Request) {
       return response({ profile });
     }
 
+    if (action === "cancel") {
+      await db
+        .prepare("DELETE FROM match_queue WHERE player_id = ? AND room_id IS NULL")
+        .bind(playerId)
+        .run();
+      return response({ ok: true });
+    }
+
     if (action === "match") {
       const name = cleanName(payload.name);
       const startingRating = 1200;

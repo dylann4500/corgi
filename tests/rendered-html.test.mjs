@@ -74,6 +74,7 @@ test("guards requeues and keeps one server-backed profile per browser", async ()
   assert.match(page, /lifecycleRef/);
   assert.match(page, /pollGenerationRef/);
   assert.match(arena, /action === "profile"/);
+  assert.match(arena, /action === "cancel"/);
   assert.match(arena, /room_id = \?/);
   assert.match(arena, /previousQueue\.status/);
   assert.match(arena, /CASE WHEN id = \? THEN 1 ELSE 0 END AS is_you/);
