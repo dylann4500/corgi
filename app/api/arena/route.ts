@@ -1,4 +1,5 @@
 import { ensureArenaSchema, getD1 } from "../../../db";
+import { env } from "cloudflare:workers";
 
 type Score = {
   total: number;
@@ -214,6 +215,42 @@ export async function GET(request: Request) {
     const url = new URL(request.url);
     const action = url.searchParams.get("action");
     const db = getD1();
+
+    if (action === "ice") {
+      const runtime = env as unknown as {
+        TURN_KEY_ID?: string;
+        TURN_KEY_API_TOKEN?: string;
+      };
+      if (runtime.TURN_KEY_ID && runtime.TURN_KEY_API_TOKEN) {
+        const credentialResponse = await fetch(
+          `https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(runtime.TURN_KEY_ID)}/credentials/generate-ice-servers`,
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${runtime.TURN_KEY_API_TOKEN}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ ttl: 3600 }),
+          },
+        );
+        if (credentialResponse.ok) {
+          const credentials = (await credentialResponse.json()) as {
+            iceServers?: Array<Record<string, unknown>>;
+          };
+          if (credentials.iceServers?.length) {
+            return response({ iceServers: credentials.iceServers, relay: true });
+          }
+        }
+      }
+      return response({
+        iceServers: [
+          { urls: "stun:stun.cloudflare.com:3478" },
+          { urls: "stun:stun.l.google.com:19302" },
+          { urls: "stun:global.stun.twilio.com:3478" },
+        ],
+        relay: false,
+      });
+    }
 
     if (action === "leaderboard") {
       const rows = await db

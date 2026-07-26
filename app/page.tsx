@@ -346,12 +346,24 @@ export default function Home() {
       if (peerRef.current || !streamRef.current) return peerRef.current;
       setConnectionState("connecting");
       setArenaNote("Opening a secure peer-to-peer tunnel...");
+      let iceServers: RTCIceServer[] = [
+        { urls: "stun:stun.cloudflare.com:3478" },
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:global.stun.twilio.com:3478" },
+      ];
+      try {
+        const iceResponse = await fetch("/api/arena?action=ice", { cache: "no-store" });
+        const icePayload = (await iceResponse.json()) as {
+          iceServers?: RTCIceServer[];
+          relay?: boolean;
+        };
+        if (icePayload.iceServers?.length) iceServers = icePayload.iceServers;
+        if (icePayload.relay) setArenaNote("Global relay ready · Opening encrypted media...");
+      } catch {
+        // Direct STUN negotiation remains available.
+      }
       const peer = new RTCPeerConnection({
-        iceServers: [
-          { urls: "stun:stun.cloudflare.com:3478" },
-          { urls: "stun:stun.l.google.com:19302" },
-          { urls: "stun:global.stun.twilio.com:3478" },
-        ],
+        iceServers,
         iceCandidatePoolSize: 10,
       });
       peerRef.current = peer;
