@@ -133,6 +133,8 @@ export default function Home() {
   const reconnectAttemptRef = useRef(false);
   const lifecycleRef = useRef(0);
   const pollGenerationRef = useRef(0);
+  const mediaReportedRoomRef = useRef<string | null>(null);
+  const mediaReadyRetryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const prompt = prompts[room?.promptIndex ?? 0];
   const rival = room?.rival ?? { name: "Mystery Pup", rating: 1200 };
@@ -267,6 +269,11 @@ export default function Home() {
     scheduledStartRef.current = null;
     lastSignalIdRef.current = 0;
     reconnectAttemptRef.current = false;
+    mediaReportedRoomRef.current = null;
+    if (mediaReadyRetryRef.current !== null) {
+      clearTimeout(mediaReadyRetryRef.current);
+      mediaReadyRetryRef.current = null;
+    }
     setRemoteVideo(false);
     setConnectionState("idle");
   }, [clearRoundTimers]);
@@ -315,6 +322,37 @@ export default function Home() {
         roomId: activeRoom.id,
         signal,
       }),
+    [playerId],
+  );
+
+  const reportMediaConnected = useCallback(
+    function report(activeRoom: Room) {
+      if (
+        roomRef.current?.id !== activeRoom.id ||
+        mediaReportedRoomRef.current === activeRoom.id
+      ) {
+        return;
+      }
+      mediaReportedRoomRef.current = activeRoom.id;
+      if (roomRef.current) {
+        roomRef.current = { ...roomRef.current, ready: true };
+      }
+      setRoom((current) =>
+        current?.id === activeRoom.id ? { ...current, ready: true } : current,
+      );
+      setRoundPhase("ready");
+      setArenaNote("Both media tunnels are live · Synchronizing countdown...");
+      void arenaPost({
+        action: "connected",
+        playerId,
+        roomId: activeRoom.id,
+      }).catch(() => {
+        if (roomRef.current?.id !== activeRoom.id) return;
+        mediaReportedRoomRef.current = null;
+        setArenaNote("Media is live · Confirming countdown sync...");
+        mediaReadyRetryRef.current = setTimeout(() => report(activeRoom), 900);
+      });
+    },
     [playerId],
   );
 
@@ -389,13 +427,19 @@ export default function Home() {
           remoteVideoRef.current.srcObject = stream;
           void remoteVideoRef.current.play().catch(() => undefined);
         }
+        if (peer.connectionState === "connected") {
+          reportMediaConnected(activeRoom);
+        }
       };
       peer.onconnectionstatechange = () => {
         if (peerRef.current !== peer || !isCurrentRoom()) return;
         if (peer.connectionState === "connected") {
           setConnectionState("connected");
-          setArenaNote("Live peer-to-peer connection · End-to-end encrypted");
+          setArenaNote("Live peer-to-peer media · Starting automatically...");
           reconnectAttemptRef.current = false;
+          if (remoteStreamRef.current) {
+            reportMediaConnected(activeRoom);
+          }
         } else if (peer.connectionState === "disconnected") {
           setConnectionState("recovering");
           setArenaNote("Your rival’s connection is recovering...");
@@ -423,7 +467,7 @@ export default function Home() {
       }
       return peer;
     },
-    [playerId, sendSignal],
+    [playerId, reportMediaConnected, sendSignal],
   );
 
   const handleSignals = useCallback(
@@ -693,21 +737,46 @@ export default function Home() {
     }
   }, [displayName, playerId]);
 
+  const primeAudioContext = useCallback(() => {
+    try {
+      if (!contextRef.current) {
+        const AudioContextClass =
+          window.AudioContext ||
+          (window as typeof window & { webkitAudioContext: typeof AudioContext })
+            .webkitAudioContext;
+        contextRef.current = new AudioContextClass();
+      }
+      void contextRef.current.resume().catch(() => undefined);
+    } catch {
+      // The round can still retry audio activation when its synchronized timer fires.
+    }
+  }, []);
+
   const enterArena = async () => {
-    setError("");
     if (!playerId) return;
+    primeAudioContext();
+    closePeer();
+    const lifecycle = lifecycleRef.current;
+    roomRef.current = null;
+    setRoom(null);
+    setRoundPhase("connecting");
+    setTimeLeft(10);
+    setCountdown(3);
+    setScore(null);
+    setRivalScore(null);
+    setWave([]);
+    setOpponentWave([]);
+    setError("");
+    setArenaNote("Preparing your camera and microphone...");
     const mediaAvailable = await requestMedia();
+    if (lifecycleRef.current !== lifecycle) return;
     if (!mediaAvailable) {
       setError("Allow microphone access to join a real online bark-off.");
+      setCurrentStage("lobby");
       return;
     }
     await saveProfileName();
-    closePeer();
-    const lifecycle = lifecycleRef.current;
-    setRoom(null);
-    roomRef.current = null;
-    setScore(null);
-    setRivalScore(null);
+    if (lifecycleRef.current !== lifecycle) return;
     lastSignalIdRef.current = 0;
     setArenaNote("Sniffing for a live rival...");
     setCurrentStage("matching");
@@ -725,6 +794,7 @@ export default function Home() {
         setRoom(matchedRoom);
         setRating(matchedRoom.rating);
         setRecord(matchedRoom.record);
+        setRoundPhase("connecting");
         setCurrentStage("battle");
         await handleSignals(matchedRoom, (payload.signals ?? []) as ArenaSignal[]);
       }
@@ -732,30 +802,6 @@ export default function Home() {
       if (lifecycleRef.current !== lifecycle) return;
       setError(caught instanceof Error ? caught.message : "Could not enter the arena.");
       setCurrentStage("lobby");
-    }
-  };
-
-  const readyUp = async () => {
-    const activeRoom = roomRef.current;
-    if (!activeRoom || connectionState !== "connected") return;
-    try {
-      if (!contextRef.current) {
-        const AudioContextClass =
-          window.AudioContext ||
-          (window as typeof window & { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-        contextRef.current = new AudioContextClass();
-      }
-      await contextRef.current.resume();
-      await arenaPost({
-        action: "ready",
-        playerId,
-        roomId: activeRoom.id,
-      });
-      setRoom((current) => (current ? { ...current, ready: true } : current));
-      setRoundPhase("ready");
-      setArenaNote("You’re ready. Waiting for your rival’s paw...");
-    } catch {
-      setError("The judge missed that. Tap ready again.");
     }
   };
 
@@ -892,7 +938,7 @@ export default function Home() {
           <div className="how-it-works">
             <span className="section-label">HOW IT WORKS</span>
             <div><b>01</b><strong>GET MATCHED</strong><p>A live rival joins you from anywhere in the world.</p></div>
-            <div><b>02</b><strong>READY TOGETHER</strong><p>Both cameras connect and the same prompt appears.</p></div>
+            <div><b>02</b><strong>AUTO-SYNC CAMERAS</strong><p>The countdown starts automatically when both live media feeds connect.</p></div>
             <div><b>03</b><strong>BARK FOR GLORY</strong><p>Pitch, rhythm, sustain and tone are judged against the shared mood.</p></div>
           </div>
           <div className="hackathon-ribbon">BUILT FOR CORGI HACKS <span>✦</span> MAY THE BEST BARK WIN</div>
@@ -955,7 +1001,7 @@ export default function Home() {
                 {roundPhase === "barking" && <span className="live-chip"><i /> BARKING</span>}
               </div>
               <Waveform values={wave} active={roundPhase === "barking"} color={prompt.color} />
-              <div className="player-meta"><strong>{displayName || "YOU"}</strong><span>{room.ready ? "READY TO BARK" : "THE UNDERDOG"}</span></div>
+              <div className="player-meta"><strong>{displayName || "YOU"}</strong><span>{room.ready ? "MEDIA SYNCED" : "CONNECTING"}</span></div>
             </article>
 
             <div className="battle-vs"><span>VS</span><i /></div>
@@ -966,6 +1012,10 @@ export default function Home() {
                   ref={remoteVideoRef}
                   autoPlay
                   playsInline
+                  onPlaying={() => {
+                    const activeRoom = roomRef.current;
+                    if (activeRoom) reportMediaConnected(activeRoom);
+                  }}
                   className={remoteVideo ? "remote-feed remote-feed--visible" : "remote-feed"}
                   aria-label={`${rival.name}'s live camera`}
                 />
@@ -979,7 +1029,7 @@ export default function Home() {
                 <span className="demo-chip live-peer-chip"><i /> REAL PLAYER</span>
               </div>
               <Waveform values={opponentWave} active={roundPhase === "barking"} color="#b8ec57" />
-              <div className="player-meta"><strong>{rival.name}</strong><span>{room.rivalReady ? "READY TO BARK" : "GETTING READY"}</span></div>
+              <div className="player-meta"><strong>{rival.name}</strong><span>{room.rivalReady ? "MEDIA SYNCED" : "CONNECTING"}</span></div>
             </article>
           </div>
 
@@ -989,15 +1039,15 @@ export default function Home() {
                 <span className="record-dot" /><strong>CONNECTING CAMERAS</strong><small>SECURE P2P HANDSHAKE</small>
               </button>
             )}
-            {(roundPhase === "ready" || roundPhase === "connecting") &&
-              connectionState === "connected" &&
-              !room.ready && (
-                <button className="bark-button" onClick={readyUp}>
-                  <span className="bark-rings" /><PawMark /><strong>READY TO BARK</strong><small>ROUND STARTS WHEN BOTH READY</small>
-                </button>
-              )}
             {room.ready && !room.startsAt && (
-              <div className="judging-state"><span>✦</span><strong>WAITING FOR {rival.name.toUpperCase()}...</strong></div>
+              <div className="judging-state">
+                <span>✦</span>
+                <strong>
+                  {room.rivalReady
+                    ? "MEDIA LOCKED · STARTING COUNTDOWN..."
+                    : `WAITING FOR ${rival.name.toUpperCase()}’S VIDEO...`}
+                </strong>
+              </div>
             )}
             {roundPhase === "countdown" && (
               <div className="countdown-state"><strong>{countdown}</strong><span>GET READY TO BARK</span></div>
@@ -1010,7 +1060,7 @@ export default function Home() {
             {roundPhase === "judging" && (
               <div className="judging-state"><span>✦</span><strong>WAITING FOR BOTH SCORES...</strong></div>
             )}
-            <p>{arenaNote} · Headphones strongly recommended</p>
+            <p>{arenaNote} · The round starts automatically · Headphones recommended</p>
             <button className="leave-link" onClick={() => void leaveArena()}>Leave match</button>
           </div>
         </section>

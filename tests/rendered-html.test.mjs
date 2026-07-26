@@ -73,10 +73,23 @@ test("guards requeues and keeps one server-backed profile per browser", async ()
   assert.match(page, /action=profile/);
   assert.match(page, /lifecycleRef/);
   assert.match(page, /pollGenerationRef/);
+  assert.match(page, /reportMediaConnected/);
+  assert.match(page, /action: "connected"/);
+  assert.doesNotMatch(page, /onClick=\{readyUp\}/);
   assert.match(arena, /action === "profile"/);
   assert.match(arena, /action === "cancel"/);
+  assert.match(arena, /action === "connected"/);
+  assert.match(arena, /DELETE FROM match_queue WHERE player_id = \? AND room_id = \?/);
   assert.match(arena, /room_id = \?/);
   assert.match(arena, /previousQueue\.status/);
+  assert.match(arena, /Math\.pow\(10, \(room\.player2_rating - room\.player1_rating\) \/ 400\)/);
   assert.match(arena, /CASE WHEN id = \? THEN 1 ELSE 0 END AS is_you/);
   assert.match(reset, /DELETE FROM `players`/);
+
+  const favoriteExpected = 1 / (1 + 10 ** ((1000 - 1600) / 400));
+  const underdogExpected = 1 / (1 + 10 ** ((1600 - 1000) / 400));
+  const favoriteUpsetLoss = Math.round(24 * (0 - favoriteExpected));
+  const underdogUpsetWin = Math.round(24 * (1 - underdogExpected));
+  assert.ok(underdogUpsetWin > 12);
+  assert.ok(Math.abs(favoriteUpsetLoss) > 12);
 });

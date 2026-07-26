@@ -230,6 +230,13 @@ async function pollRoom(playerId: string, requestedRoomId: string | null, afterS
     room = (await getRoom(room.id)) ?? room;
   }
 
+  if (room.status === "abandoned") {
+    await db
+      .prepare("DELETE FROM match_queue WHERE player_id = ? AND room_id = ?")
+      .bind(playerId, room.id)
+      .run();
+  }
+
   if (room.player1_ready && room.player2_ready && !room.starts_at) {
     const startsAt = Date.now() + 4000;
     await db
@@ -537,9 +544,12 @@ export async function POST(request: Request) {
       return response({ ok: result.success });
     }
 
-    if (action === "ready") {
+    if (action === "connected" || action === "ready") {
       const field = isPlayer1 ? "player1_ready" : "player2_ready";
-      await db.prepare(`UPDATE rooms SET ${field} = 1, updated_at = ? WHERE id = ?`).bind(now, roomId).run();
+      await db
+        .prepare(`UPDATE rooms SET ${field} = 1, updated_at = ? WHERE id = ? AND status = 'matched'`)
+        .bind(now, roomId)
+        .run();
       return response({ ok: true });
     }
 
