@@ -308,7 +308,12 @@ export default function Home() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false },
-        video: { facingMode: "user", width: { ideal: 960 }, height: { ideal: 720 } },
+        video: {
+          facingMode: "user",
+          width: { ideal: 640, max: 960 },
+          height: { ideal: 480, max: 720 },
+          frameRate: { ideal: 15, max: 24 },
+        },
       });
       streamRef.current = stream;
       setMicReady(stream.getAudioTracks().length > 0);
@@ -352,7 +357,15 @@ export default function Home() {
         { urls: "stun:global.stun.twilio.com:3478" },
       ];
       try {
-        const iceResponse = await fetch("/api/arena?action=ice", { cache: "no-store" });
+        const iceParams = new URLSearchParams({
+          action: "ice",
+          playerId,
+          roomId: activeRoom.id,
+        });
+        const iceResponse = await fetch(`/api/arena?${iceParams}`, {
+          cache: "no-store",
+        });
+        if (!iceResponse.ok) throw new Error("Relay credentials unavailable.");
         const icePayload = (await iceResponse.json()) as {
           iceServers?: RTCIceServer[];
           relay?: boolean;
@@ -368,7 +381,19 @@ export default function Home() {
       });
       peerRef.current = peer;
       for (const track of streamRef.current.getTracks()) {
-        peer.addTrack(track, streamRef.current);
+        const sender = peer.addTrack(track, streamRef.current);
+        if (track.kind === "video") {
+          const parameters = sender.getParameters();
+          parameters.encodings = (parameters.encodings?.length
+            ? parameters.encodings
+            : [{}]
+          ).map((encoding) => ({
+            ...encoding,
+            maxBitrate: 450_000,
+            maxFramerate: 15,
+          }));
+          void sender.setParameters(parameters).catch(() => undefined);
+        }
       }
 
       peer.onicecandidate = (event) => {
@@ -417,7 +442,7 @@ export default function Home() {
       }
       return peer;
     },
-    [sendSignal],
+    [playerId, sendSignal],
   );
 
   const handleSignals = useCallback(

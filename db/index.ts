@@ -90,6 +90,14 @@ export function ensureArenaSchema() {
         )`),
         db.prepare("CREATE INDEX IF NOT EXISTS signals_recipient_idx ON signals (room_id, recipient_id, id)"),
         db.prepare("CREATE INDEX IF NOT EXISTS signals_created_idx ON signals (created_at)"),
+        db.prepare(`CREATE TABLE IF NOT EXISTS turn_grants (
+          id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+          room_id TEXT NOT NULL,
+          player_id TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        )`),
+        db.prepare("CREATE INDEX IF NOT EXISTS turn_grants_player_idx ON turn_grants (player_id, created_at)"),
+        db.prepare("CREATE INDEX IF NOT EXISTS turn_grants_created_idx ON turn_grants (created_at)"),
       ])
       .then(() => undefined)
       .catch((error) => {

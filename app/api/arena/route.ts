@@ -24,6 +24,7 @@ type RoomRow = {
   player2_name: string;
   player1_rating: number;
   player2_rating: number;
+  created_at: number;
 };
 
 type SignalRow = {
@@ -33,6 +34,12 @@ type SignalRow = {
 
 const ID_PATTERN = /^[a-zA-Z0-9_-]{8,80}$/;
 const ROOM_PATTERN = /^[a-zA-Z0-9-]{20,80}$/;
+const METERED_APP_PATTERN = /^[a-z0-9-]{2,63}$/;
+const DEFAULT_ICE_SERVERS = [
+  { urls: "stun:stun.cloudflare.com:3478" },
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:global.stun.twilio.com:3478" },
+];
 
 function response(body: unknown, status = 200) {
   return Response.json(body, {
@@ -55,6 +62,48 @@ function validId(value: unknown) {
 
 function validRoom(value: unknown) {
   return typeof value === "string" && ROOM_PATTERN.test(value);
+}
+
+function normalizeIceServers(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    if (!entry || typeof entry !== "object") return [];
+    const record = entry as Record<string, unknown>;
+    const urls = Array.isArray(record.urls)
+      ? record.urls.filter(
+          (url): url is string =>
+            typeof url === "string" && /^(stun|turn|turns):/i.test(url),
+        )
+      : typeof record.urls === "string" && /^(stun|turn|turns):/i.test(record.urls)
+        ? record.urls
+        : null;
+    if (!urls || (Array.isArray(urls) && urls.length === 0)) return [];
+    return [
+      {
+        urls,
+        ...(typeof record.username === "string" ? { username: record.username } : {}),
+        ...(typeof record.credential === "string" ? { credential: record.credential } : {}),
+      },
+    ];
+  });
+}
+
+async function getMeteredIceServers(appName: string, apiKey: string) {
+  if (!METERED_APP_PATTERN.test(appName)) return [];
+  try {
+    const credentialUrl = new URL(
+      `https://${appName}.metered.live/api/v1/turn/credentials`,
+    );
+    credentialUrl.searchParams.set("apiKey", apiKey);
+    const credentialResponse = await fetch(credentialUrl, {
+      headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(6_000),
+    });
+    if (!credentialResponse.ok) return [];
+    return normalizeIceServers(await credentialResponse.json());
+  } catch {
+    return [];
+  }
 }
 
 function parseScore(value: unknown): Score | null {
@@ -217,10 +266,55 @@ export async function GET(request: Request) {
     const db = getD1();
 
     if (action === "ice") {
+      const playerId = url.searchParams.get("playerId");
+      const roomId = url.searchParams.get("roomId");
+      if (!validId(playerId) || !validRoom(roomId)) {
+        return response({ error: "A valid matched room is required." }, 400);
+      }
+      const room = await getRoom(roomId);
+      const isMember =
+        room && (room.player1_id === playerId || room.player2_id === playerId);
+      const roomIsActive =
+        room &&
+        (room.status === "matched" || room.status === "countdown") &&
+        room.created_at > Date.now() - 15 * 60_000;
+      if (!isMember || !roomIsActive) {
+        return response({ error: "Active match not found." }, 404);
+      }
+
+      const now = Date.now();
+      await db
+        .prepare("DELETE FROM turn_grants WHERE created_at < ?")
+        .bind(now - 60 * 60_000)
+        .run();
+      const grant = await db
+        .prepare(`INSERT INTO turn_grants (room_id, player_id, created_at)
+          SELECT ?, ?, ?
+          WHERE (
+            SELECT COUNT(*) FROM turn_grants
+            WHERE player_id = ? AND created_at > ?
+          ) < 8`)
+        .bind(roomId, playerId, now, playerId, now - 10 * 60_000)
+        .run();
+      if (!grant.meta?.changes) {
+        return response({ error: "Relay request limit reached. Try again shortly." }, 429);
+      }
+
       const runtime = env as unknown as {
+        METERED_TURN_APP?: string;
+        METERED_TURN_API_KEY?: string;
         TURN_KEY_ID?: string;
         TURN_KEY_API_TOKEN?: string;
       };
+      if (runtime.METERED_TURN_APP && runtime.METERED_TURN_API_KEY) {
+        const iceServers = await getMeteredIceServers(
+          runtime.METERED_TURN_APP,
+          runtime.METERED_TURN_API_KEY,
+        );
+        if (iceServers.length) {
+          return response({ iceServers, relay: true, provider: "metered" });
+        }
+      }
       if (runtime.TURN_KEY_ID && runtime.TURN_KEY_API_TOKEN) {
         const credentialResponse = await fetch(
           `https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(runtime.TURN_KEY_ID)}/credentials/generate-ice-servers`,
@@ -238,17 +332,26 @@ export async function GET(request: Request) {
             iceServers?: Array<Record<string, unknown>>;
           };
           if (credentials.iceServers?.length) {
-            return response({ iceServers: credentials.iceServers, relay: true });
+            const iceServers = normalizeIceServers(credentials.iceServers);
+            if (!iceServers.length) {
+              return response({
+                iceServers: DEFAULT_ICE_SERVERS,
+                relay: false,
+                provider: "direct",
+              });
+            }
+            return response({
+              iceServers,
+              relay: true,
+              provider: "cloudflare",
+            });
           }
         }
       }
       return response({
-        iceServers: [
-          { urls: "stun:stun.cloudflare.com:3478" },
-          { urls: "stun:stun.l.google.com:19302" },
-          { urls: "stun:global.stun.twilio.com:3478" },
-        ],
+        iceServers: DEFAULT_ICE_SERVERS,
         relay: false,
+        provider: "direct",
       });
     }
 

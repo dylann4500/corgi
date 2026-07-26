@@ -69,3 +69,17 @@ export const signals = sqliteTable(
     index("signals_created_idx").on(table.createdAt),
   ],
 );
+
+export const turnGrants = sqliteTable(
+  "turn_grants",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    roomId: text("room_id").notNull(),
+    playerId: text("player_id").notNull(),
+    createdAt: integer("created_at").notNull(),
+  },
+  (table) => [
+    index("turn_grants_player_idx").on(table.playerId, table.createdAt),
+    index("turn_grants_created_idx").on(table.createdAt),
+  ],
+);
