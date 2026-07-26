@@ -1,12 +1,11 @@
 import { ensureArenaSchema, getD1 } from "../../../db";
 import { env } from "cloudflare:workers";
-
-type Score = {
-  total: number;
-  power: number;
-  control: number;
-  character: number;
-};
+import {
+  barkPrompts,
+  parseBarkFeatures,
+  parseBarkScore,
+  scoreBark,
+} from "../../../lib/bark-scoring";
 
 type RoomRow = {
   id: string;
@@ -56,11 +55,11 @@ function cleanName(value: unknown) {
   return name.slice(0, 24) || "Anonymous Pup";
 }
 
-function validId(value: unknown) {
+function validId(value: unknown): value is string {
   return typeof value === "string" && ID_PATTERN.test(value);
 }
 
-function validRoom(value: unknown) {
+function validRoom(value: unknown): value is string {
   return typeof value === "string" && ROOM_PATTERN.test(value);
 }
 
@@ -106,22 +105,10 @@ async function getMeteredIceServers(appName: string, apiKey: string) {
   }
 }
 
-function parseScore(value: unknown): Score | null {
-  if (!value || typeof value !== "object") return null;
-  const record = value as Record<string, unknown>;
-  const number = (key: string) => Math.max(0, Math.min(100, Math.round(Number(record[key]) || 0)));
-  return {
-    total: number("total"),
-    power: number("power"),
-    control: number("control"),
-    character: number("character"),
-  };
-}
-
 function safeScore(value: string | null) {
   if (!value) return null;
   try {
-    return parseScore(JSON.parse(value));
+    return parseBarkScore(JSON.parse(value));
   } catch {
     return null;
   }
@@ -444,7 +431,14 @@ export async function POST(request: Request) {
           id, player1_id, player2_id, prompt_index, status, player1_ready, player2_ready,
           starts_at, player1_score, player2_score, rated, created_at, updated_at
         ) VALUES (?, ?, ?, ?, 'matched', 0, 0, NULL, NULL, NULL, 0, ?, ?)`)
-        .bind(roomId, candidate.player_id, playerId, crypto.getRandomValues(new Uint32Array(1))[0] % 6, now, now)
+        .bind(
+          roomId,
+          candidate.player_id,
+          playerId,
+          crypto.getRandomValues(new Uint32Array(1))[0] % barkPrompts.length,
+          now,
+          now,
+        )
         .run();
       return response(await pollRoom(playerId, roomId, 0));
     }
@@ -475,8 +469,9 @@ export async function POST(request: Request) {
     }
 
     if (action === "score") {
-      const score = parseScore(payload.score);
-      if (!score) return response({ error: "Invalid score." }, 400);
+      const features = parseBarkFeatures(payload.features);
+      if (!features) return response({ error: "Invalid audio features." }, 400);
+      const score = scoreBark(features, room.prompt_index);
       const field = isPlayer1 ? "player1_score" : "player2_score";
       await db
         .prepare(`UPDATE rooms SET ${field} = COALESCE(${field}, ?), status = 'judging', updated_at = ? WHERE id = ?`)

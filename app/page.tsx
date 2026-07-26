@@ -1,26 +1,20 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  analyseAudioFrame,
+  summarizeBarkFrames,
+  type BarkAudioFrame,
+} from "../lib/audio-analysis";
+import {
+  barkPrompts as prompts,
+  scoreBark,
+  type BarkScore as Score,
+} from "../lib/bark-scoring";
 
 type Stage = "lobby" | "matching" | "battle" | "results" | "leaderboard";
 type RoundPhase = "connecting" | "ready" | "countdown" | "barking" | "judging";
 type ConnectionState = "idle" | "connecting" | "connected" | "recovering" | "failed";
-
-type Prompt = {
-  title: string;
-  cue: string;
-  emoji: string;
-  judge: string;
-  color: string;
-  weights: [number, number, number];
-};
-
-type Score = {
-  total: number;
-  power: number;
-  control: number;
-  character: number;
-};
 
 type Room = {
   id: string;
@@ -50,57 +44,6 @@ type Leader = {
   wins: number;
   losses: number;
 };
-
-const prompts: Prompt[] = [
-  {
-    title: "The Joy Bark",
-    cue: "Your human just came home after 100 years.",
-    emoji: "🥹",
-    judge: "Bright tone · rising energy · pure joy",
-    color: "#ffcc4d",
-    weights: [0.35, 0.2, 0.45],
-  },
-  {
-    title: "Tiny But Terrifying",
-    cue: "You weigh six pounds. Act like you own the block.",
-    emoji: "😤",
-    judge: "Big power · sharp attacks · no hesitation",
-    color: "#ff735c",
-    weights: [0.55, 0.25, 0.2],
-  },
-  {
-    title: "The Dramatic Whimper",
-    cue: "Dinner is seventeen seconds late. Devastating.",
-    emoji: "🥺",
-    judge: "Dynamic range · restraint · emotional damage",
-    color: "#b69cff",
-    weights: [0.15, 0.4, 0.45],
-  },
-  {
-    title: "Moonlight Howl",
-    cue: "Call the whole pack. Make it cinematic.",
-    emoji: "🌕",
-    judge: "Sustain · smooth tone · legendary finish",
-    color: "#79d8ff",
-    weights: [0.4, 0.4, 0.2],
-  },
-  {
-    title: "Rapid-Fire Yaps",
-    cue: "The mail carrier has entered your jurisdiction.",
-    emoji: "📦",
-    judge: "Fast attacks · rhythm · maximum urgency",
-    color: "#b8ec57",
-    weights: [0.3, 0.25, 0.45],
-  },
-  {
-    title: "The Sneaky Boof",
-    cue: "You heard something downstairs. Probably a sock.",
-    emoji: "🕵️",
-    judge: "Quiet control · suspense · one perfect boof",
-    color: "#f4a4e3",
-    weights: [0.15, 0.55, 0.3],
-  },
-];
 
 const showcaseLeaders = [
   { name: "Sir Barksalot", rating: 1842, wins: 94, losses: 21 },
@@ -189,8 +132,7 @@ export default function Home() {
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const startTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const samplesRef = useRef<number[]>([]);
-  const crossingsRef = useRef<number[]>([]);
+  const audioFramesRef = useRef<BarkAudioFrame[]>([]);
   const lastSignalIdRef = useRef(0);
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const scheduledStartRef = useRef<number | null>(null);
@@ -482,36 +424,6 @@ export default function Home() {
     [createPeer, sendSignal],
   );
 
-  const calculateLocalScore = useCallback((): Score => {
-    const samples = samplesRef.current;
-    const crossings = crossingsRef.current;
-    const average = samples.length
-      ? samples.reduce((sum, value) => sum + value, 0) / samples.length
-      : 0.04;
-    const variance = samples.length
-      ? samples.reduce((sum, value) => sum + Math.pow(value - average, 2), 0) / samples.length
-      : 0;
-    const max = samples.length ? Math.max(...samples) : 0.05;
-    const crossingAverage = crossings.length
-      ? crossings.reduce((sum, value) => sum + value, 0) / crossings.length
-      : 0;
-    const activePrompt = prompts[roomRef.current?.promptIndex ?? 0];
-    const power = clamp(Math.round(38 + average * 62 + max * 22), 25, 99);
-    const control = clamp(Math.round(96 - Math.sqrt(variance) * 72), 35, 99);
-    const character = clamp(Math.round(46 + Math.sqrt(variance) * 122 + crossingAverage * 90), 30, 99);
-    const [powerWeight, controlWeight, characterWeight] = activePrompt.weights;
-    return {
-      total: clamp(
-        Math.round(power * powerWeight + control * controlWeight + character * characterWeight),
-        30,
-        99,
-      ),
-      power,
-      control,
-      character,
-    };
-  }, []);
-
   const stopRound = useCallback(() => {
     if (animationRef.current) cancelAnimationFrame(animationRef.current);
     if (timerRef.current) clearInterval(timerRef.current);
@@ -519,18 +431,19 @@ export default function Home() {
     timerRef.current = null;
     setRoundPhase("judging");
     setTimeLeft(0);
-    const result = calculateLocalScore();
-    setScore(result);
+    const features = summarizeBarkFrames(audioFramesRef.current, 10_000);
     const activeRoom = roomRef.current;
+    const result = scoreBark(features, activeRoom?.promptIndex ?? 0);
+    setScore(result);
     if (activeRoom) {
       void arenaPost({
         action: "score",
         playerId,
         roomId: activeRoom.id,
-        score: result,
-      }).catch(() => setError("Your score is saved locally, but the judge is reconnecting."));
+        features,
+      }).catch(() => setError("Your performance was measured, but the judge is reconnecting."));
     }
-  }, [calculateLocalScore, playerId]);
+  }, [playerId]);
 
   const startSyncedRound = useCallback(() => {
     const stream = streamRef.current;
@@ -542,13 +455,12 @@ export default function Home() {
     setRivalScore(null);
     setWave([]);
     setOpponentWave([]);
-    samplesRef.current = [];
-    crossingsRef.current = [];
+    audioFramesRef.current = [];
 
     const localSource = context.createMediaStreamSource(stream);
     const localAnalyser = context.createAnalyser();
-    localAnalyser.fftSize = 1024;
-    localAnalyser.smoothingTimeConstant = 0.42;
+    localAnalyser.fftSize = 2048;
+    localAnalyser.smoothingTimeConstant = 0.24;
     localSource.connect(localAnalyser);
     localAnalyserRef.current = localAnalyser;
 
@@ -561,35 +473,50 @@ export default function Home() {
       remoteAnalyserRef.current = remoteAnalyser;
     }
 
-    const localData = new Uint8Array(localAnalyser.fftSize);
+    const localData = new Float32Array(localAnalyser.fftSize);
+    const localSpectrum = new Uint8Array(localAnalyser.frequencyBinCount);
     const remoteData = new Uint8Array(remoteAnalyserRef.current?.fftSize ?? 512);
-    const sample = () => {
-      localAnalyser.getByteTimeDomainData(localData);
-      let energy = 0;
-      let zeroCrossings = 0;
-      for (let index = 0; index < localData.length; index += 1) {
-        const normalized = (localData[index] - 128) / 128;
-        energy += normalized * normalized;
-        if (index > 0 && (localData[index - 1] - 128) * (localData[index] - 128) < 0) {
-          zeroCrossings += 1;
-        }
-      }
-      const boosted = clamp(Math.sqrt(energy / localData.length) * 5.5, 0.01, 1);
-      samplesRef.current.push(boosted);
-      crossingsRef.current.push(zeroCrossings / localData.length);
-      setWave((current) => [...current.slice(-35), 9 + boosted * 87]);
+    let lastFeatureSample = 0;
+    const sample = (now: number) => {
+      if (now - lastFeatureSample >= 72) {
+        localAnalyser.getFloatTimeDomainData(localData);
+        localAnalyser.getByteFrequencyData(localSpectrum);
+        const frame = analyseAudioFrame(
+          now,
+          localData,
+          localSpectrum,
+          context.sampleRate,
+        );
+        audioFramesRef.current.push(frame);
+        const displayLevel = clamp(
+          (20 * Math.log10(Math.max(frame.rms, 1e-5)) + 60) / 50,
+          0.01,
+          1,
+        );
+        setWave((current) => [...current.slice(-35), 9 + displayLevel * 87]);
 
-      const remoteAnalyser = remoteAnalyserRef.current;
-      if (remoteAnalyser) {
-        remoteAnalyser.getByteTimeDomainData(remoteData);
-        let remoteEnergy = 0;
-        for (const value of remoteData) remoteEnergy += Math.pow((value - 128) / 128, 2);
-        const remoteLevel = clamp(Math.sqrt(remoteEnergy / remoteData.length) * 5.5, 0.01, 1);
-        setOpponentWave((current) => [...current.slice(-35), 9 + remoteLevel * 87]);
+        const remoteAnalyser = remoteAnalyserRef.current;
+        if (remoteAnalyser) {
+          remoteAnalyser.getByteTimeDomainData(remoteData);
+          let remoteEnergy = 0;
+          for (const value of remoteData) {
+            remoteEnergy += Math.pow((value - 128) / 128, 2);
+          }
+          const remoteLevel = clamp(
+            Math.sqrt(remoteEnergy / remoteData.length) * 5.5,
+            0.01,
+            1,
+          );
+          setOpponentWave((current) => [
+            ...current.slice(-35),
+            9 + remoteLevel * 87,
+          ]);
+        }
+        lastFeatureSample = now;
       }
       animationRef.current = requestAnimationFrame(sample);
     };
-    sample();
+    animationRef.current = requestAnimationFrame(sample);
 
     const endsAt = Date.now() + 10_000;
     timerRef.current = setInterval(() => {
@@ -829,7 +756,7 @@ export default function Home() {
               <p className="kicker">THE INTERNET&apos;S #1 COMPETITIVE BARKING ARENA</p>
               <h1>PROVE YOU&apos;RE<br /><em>TOP DOG.</em></h1>
               <p className="hero-sub">
-                Meet a real rival anywhere in the world. One prompt. Ten seconds. One top dog.
+                Meet a real rival anywhere in the world. Ten prompt-aware modes. Ten seconds. One top dog.
               </p>
               <label className="name-field">
                 <span>YOUR BARK NAME</span>
@@ -878,7 +805,7 @@ export default function Home() {
             <span className="section-label">HOW IT WORKS</span>
             <div><b>01</b><strong>GET MATCHED</strong><p>A live rival joins you from anywhere in the world.</p></div>
             <div><b>02</b><strong>READY TOGETHER</strong><p>Both cameras connect and the same prompt appears.</p></div>
-            <div><b>03</b><strong>BARK FOR GLORY</strong><p>Both performances are scored and Elo updates globally.</p></div>
+            <div><b>03</b><strong>BARK FOR GLORY</strong><p>Pitch, rhythm, sustain and tone are judged against the shared mood.</p></div>
           </div>
           <div className="hackathon-ribbon">BUILT FOR CORGI HACKS <span>✦</span> MAY THE BEST BARK WIN</div>
         </section>
@@ -920,7 +847,11 @@ export default function Home() {
 
           <div className="prompt-card" style={{ "--prompt": prompt.color } as React.CSSProperties}>
             <div className="prompt-emoji">{prompt.emoji}</div>
-            <div><small>SHARED BARK PROMPT</small><h2>{prompt.title}</h2><p>{prompt.cue}</p></div>
+            <div>
+              <small>SHARED BARK MODE · {room.promptIndex + 1}/{prompts.length}</small>
+              <h2>{prompt.title}</h2>
+              <p>{prompt.cue}</p>
+            </div>
             <div className="judge-brief"><small>JUDGED ON</small><strong>{prompt.judge}</strong></div>
           </div>
 
@@ -1021,12 +952,19 @@ export default function Home() {
               ["POWER", score.power, rivalScore.power],
               ["CONTROL", score.control, rivalScore.control],
               ["CHARACTER", score.character, rivalScore.character],
+              ["MOOD FIT", score.moodFit, rivalScore.moodFit],
             ].map(([label, yours, theirs]) => (
               <div key={label as string}>
                 <strong>{yours}</strong>
                 <span className="score-track"><i style={{ width: `${yours}%` }} /><b style={{ width: `${theirs}%` }} /></span>
                 <small>{label}</small><strong>{theirs}</strong>
               </div>
+            ))}
+          </div>
+          <div className="judge-feedback">
+            <span>PROMPT-AWARE AUDIO JUDGE NOTES</span>
+            {score.feedback.map((note, index) => (
+              <p key={`${note}-${index}`}><b>{index < 2 ? "✓" : "→"}</b>{note}</p>
             ))}
           </div>
           <div className="result-actions">
