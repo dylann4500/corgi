@@ -24,6 +24,7 @@ type Room = {
   ready: boolean;
   rivalReady: boolean;
   startsAt: number | null;
+  serverNow?: number;
   score: Score | null;
   rivalScore: Score | null;
   rival: { name: string; rating: number };
@@ -342,16 +343,21 @@ export default function Home() {
       );
       setRoundPhase("ready");
       setArenaNote("Both media tunnels are live · Synchronizing countdown...");
-      void arenaPost({
-        action: "connected",
-        playerId,
-        roomId: activeRoom.id,
-      }).catch(() => {
+      const retry = () => {
         if (roomRef.current?.id !== activeRoom.id) return;
         mediaReportedRoomRef.current = null;
         setArenaNote("Media is live · Confirming countdown sync...");
         mediaReadyRetryRef.current = setTimeout(() => report(activeRoom), 900);
-      });
+      };
+      void arenaPost({
+        action: "connected",
+        playerId,
+        roomId: activeRoom.id,
+      })
+        .then((result: { ok?: boolean }) => {
+          if (result?.ok === false) retry();
+        })
+        .catch(retry);
     },
     [playerId],
   );
@@ -612,19 +618,23 @@ export default function Home() {
   }, [stopRound]);
 
   const scheduleRound = useCallback(
-    (startsAt: number) => {
+    (startsAt: number, serverNow?: number) => {
       if (scheduledStartRef.current === startsAt) return;
       scheduledStartRef.current = startsAt;
       setRoundPhase("countdown");
+      // startsAt is stamped by the server. Rebasing it onto this device's clock
+      // keeps both players in step even when one machine's clock is skewed.
+      const localStartsAt =
+        typeof serverNow === "number" ? Date.now() + (startsAt - serverNow) : startsAt;
       const updateCountdown = () =>
-        setCountdown(Math.max(1, Math.ceil((startsAt - Date.now()) / 1000)));
+        setCountdown(Math.max(1, Math.ceil((localStartsAt - Date.now()) / 1000)));
       updateCountdown();
       countdownRef.current = setInterval(updateCountdown, 150);
       startTimeoutRef.current = setTimeout(() => {
         if (countdownRef.current) clearInterval(countdownRef.current);
         countdownRef.current = null;
         startSyncedRound();
-      }, Math.max(0, startsAt - Date.now()));
+      }, Math.max(0, localStartsAt - Date.now()));
     },
     [startSyncedRound],
   );
@@ -671,7 +681,7 @@ export default function Home() {
           }
           await handleSignals(nextRoom, (payload.signals ?? []) as ArenaSignal[]);
           if (!isCurrentPoll()) return;
-          if (nextRoom.startsAt) scheduleRound(nextRoom.startsAt);
+          if (nextRoom.startsAt) scheduleRound(nextRoom.startsAt, nextRoom.serverNow);
           if (nextRoom.score && nextRoom.rivalScore) {
             setScore(nextRoom.score);
             setRivalScore(nextRoom.rivalScore);
@@ -941,7 +951,7 @@ export default function Home() {
             <div><b>02</b><strong>AUTO-SYNC CAMERAS</strong><p>The countdown starts automatically when both live media feeds connect.</p></div>
             <div><b>03</b><strong>BARK FOR GLORY</strong><p>Pitch, rhythm, sustain and tone are judged against the shared mood.</p></div>
           </div>
-          <div className="hackathon-ribbon">BUILT FOR CORGI HACKS <span>✦</span> MAY THE BEST BARK WIN</div>
+          <div className="hackathon-ribbon">BUILT FOR SPACEX AI BUILD NIGHT AT BERKELEY <span>✦</span> MAY THE BEST BARK WIN</div>
         </section>
       )}
 
@@ -1158,7 +1168,7 @@ export default function Home() {
 
       <footer>
         <span>BARKOFF © 2026</span>
-        <span>BUILT WITH <b>♥</b> FOR CORGI HACKS</span>
+        <span>BUILT WITH <b>♥</b> + CURSOR FOR SPACEX AI BUILD NIGHT</span>
         <span>LIVE P2P MEDIA · GLOBAL SIGNALING</span>
       </footer>
     </main>

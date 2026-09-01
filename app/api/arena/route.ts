@@ -38,6 +38,22 @@ type SignalRow = {
 const ID_PATTERN = /^[a-zA-Z0-9_-]{8,80}$/;
 const ROOM_PATTERN = /^[a-zA-Z0-9-]{20,80}$/;
 const METERED_APP_PATTERN = /^[a-z0-9-]{2,63}$/;
+
+// Presence budgets. Browsers throttle timers in background tabs to roughly one
+// tick per minute, so every window here has to tolerate a minute of silence
+// from a player who is still very much present.
+const CANDIDATE_FRESH_MS = 90_000; // heartbeat age that still counts as queued
+const PRESENCE_TTL_MS = 5 * 60_000; // when an unmatched queue row is swept
+const RIVAL_TIMEOUT_MS = 25_000; // silence before a rival is declared gone
+const ROOM_GRACE_MS = 10_000; // a fresh room is never abandoned this early
+const AUTO_START_MS = 30_000; // start even if one side never reports its media
+const SCORE_WINDOW_MS = 120_000; // how late a round score may still arrive
+const ROOM_TTL_MS = 15 * 60_000; // when finished rooms are swept
+const COUNTDOWN_MS = 4_000;
+
+const LIVE_ROOM_STATUSES = "('matched', 'countdown', 'judging')";
+const FINISHED_ROOM_STATUSES = "('complete', 'abandoned')";
+
 const DEFAULT_ICE_SERVERS = [
   { urls: "stun:stun.cloudflare.com:3478" },
   { urls: "stun:stun.l.google.com:19302" },
@@ -151,6 +167,10 @@ function roomView(room: RoomRow, playerId: string) {
     ready: Boolean(isPlayer1 ? room.player1_ready : room.player2_ready),
     rivalReady: Boolean(isPlayer1 ? room.player2_ready : room.player1_ready),
     startsAt: room.starts_at,
+    // The countdown is scheduled from `startsAt - serverNow`, never from the
+    // browser's own clock, so a device with a skewed clock still starts its
+    // round in step with its rival.
+    serverNow: Date.now(),
     score: safeScore(isPlayer1 ? room.player1_score : room.player2_score),
     rivalScore: safeScore(isPlayer1 ? room.player2_score : room.player1_score),
     rival: {
@@ -196,21 +216,99 @@ async function maybeFinalize(room: RoomRow) {
   ]);
 }
 
+// Pairs the caller with the longest-waiting fresh opponent. Returns the new
+// room id, or null when there is nobody to pair with. Every exit path leaves
+// both queue rows in a consistent state: a player is either in a room that
+// exists, or back in the queue with `room_id IS NULL` and matchable again.
+async function pairWaitingPlayer(playerId: string): Promise<string | null> {
+  const db = getD1();
+  const now = Date.now();
+  const roomId = crypto.randomUUID();
+
+  const candidate = await db
+    .prepare(`UPDATE match_queue
+      SET room_id = ?, last_seen = ?
+      WHERE player_id = (
+        SELECT player_id FROM match_queue
+        WHERE room_id IS NULL AND player_id <> ? AND last_seen > ?
+        ORDER BY joined_at ASC LIMIT 1
+      ) AND room_id IS NULL
+      RETURNING player_id`)
+    .bind(roomId, now, playerId, now - CANDIDATE_FRESH_MS)
+    .first<{ player_id: string }>();
+  if (!candidate) return null;
+
+  const ownClaim = await db
+    .prepare("UPDATE match_queue SET room_id = ?, last_seen = ? WHERE player_id = ? AND room_id IS NULL")
+    .bind(roomId, now, playerId)
+    .run();
+  if (!ownClaim.meta?.changes) {
+    // Either a rival claimed us first or our own row was swept. Release the
+    // candidate so the next poll can pair them rather than stranding them on a
+    // room that will never be created.
+    await db
+      .prepare("UPDATE match_queue SET room_id = NULL WHERE player_id = ? AND room_id = ?")
+      .bind(candidate.player_id, roomId)
+      .run();
+    return null;
+  }
+
+  try {
+    await db
+      .prepare(`INSERT INTO rooms (
+        id, player1_id, player2_id, prompt_index, status, player1_ready, player2_ready,
+        starts_at, player1_score, player2_score, rated, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, 'matched', 0, 0, NULL, NULL, NULL, 0, ?, ?)`)
+      .bind(
+        roomId,
+        candidate.player_id,
+        playerId,
+        crypto.getRandomValues(new Uint32Array(1))[0] % barkPrompts.length,
+        now,
+        now,
+      )
+      .run();
+  } catch (error) {
+    // Both players hold a claim on a room that does not exist. Release them
+    // instead of leaving two clients polling a phantom room forever.
+    await db
+      .prepare("UPDATE match_queue SET room_id = NULL WHERE room_id = ?")
+      .bind(roomId)
+      .run();
+    throw error;
+  }
+  return roomId;
+}
+
 async function pollRoom(playerId: string, requestedRoomId: string | null, afterSignalId: number) {
   const db = getD1();
-  let roomId = requestedRoomId;
+  const now = Date.now();
+  const queued = await db
+    .prepare("SELECT room_id FROM match_queue WHERE player_id = ?")
+    .bind(playerId)
+    .first<{ room_id: string | null }>();
+  let roomId = requestedRoomId ?? queued?.room_id ?? null;
+  await db.prepare("UPDATE match_queue SET last_seen = ? WHERE player_id = ?").bind(now, playerId).run();
+
   if (!roomId) {
-    const queued = await db
-      .prepare("SELECT room_id FROM match_queue WHERE player_id = ?")
-      .bind(playerId)
-      .first<{ room_id: string | null }>();
-    roomId = queued?.room_id ?? null;
+    if (!queued) return { state: "waiting" };
+    // Matchmaking runs on the poll as well as on entry. Without this, two
+    // players can both sit in the queue forever: pairing only ever ran when a
+    // player POSTed `match`, so whoever was already waiting was never retried.
+    roomId = await pairWaitingPlayer(playerId);
+    if (!roomId) return { state: "waiting" };
   }
-  await db.prepare("UPDATE match_queue SET last_seen = ? WHERE player_id = ?").bind(Date.now(), playerId).run();
-  if (!roomId) return { state: "waiting" };
 
   let room = await getRoom(roomId);
-  if (!room) return { state: "waiting" };
+  if (!room) {
+    // The queue points at a room that no longer exists (swept, or a pairing
+    // that failed part way). Clear the claim so the player is matchable again.
+    await db
+      .prepare("UPDATE match_queue SET room_id = NULL WHERE player_id = ? AND room_id = ?")
+      .bind(playerId, roomId)
+      .run();
+    return { state: "waiting" };
+  }
   if (room.player1_id !== playerId && room.player2_id !== playerId) return { state: "forbidden" };
 
   const rivalId = room.player1_id === playerId ? room.player2_id : room.player1_id;
@@ -218,14 +316,13 @@ async function pollRoom(playerId: string, requestedRoomId: string | null, afterS
     .prepare("SELECT last_seen FROM match_queue WHERE player_id = ?")
     .bind(rivalId)
     .first<{ last_seen: number }>();
-  if (
-    room.status !== "complete" &&
-    room.status !== "abandoned" &&
-    (!rivalPresence || rivalPresence.last_seen < Date.now() - 25_000)
-  ) {
+  const roomIsLive = room.status !== "complete" && room.status !== "abandoned";
+  const rivalIsGone = !rivalPresence || rivalPresence.last_seen < now - RIVAL_TIMEOUT_MS;
+  if (roomIsLive && rivalIsGone && room.created_at < now - ROOM_GRACE_MS) {
     await db
-      .prepare("UPDATE rooms SET status = 'abandoned', updated_at = ? WHERE id = ?")
-      .bind(Date.now(), room.id)
+      .prepare(`UPDATE rooms SET status = 'abandoned', updated_at = ?
+        WHERE id = ? AND status NOT IN ${FINISHED_ROOM_STATUSES}`)
+      .bind(now, room.id)
       .run();
     room = (await getRoom(room.id)) ?? room;
   }
@@ -237,11 +334,17 @@ async function pollRoom(playerId: string, requestedRoomId: string | null, afterS
       .run();
   }
 
-  if (room.player1_ready && room.player2_ready && !room.starts_at) {
-    const startsAt = Date.now() + 4000;
+  // Start once both sides report live media, or once the room has waited long
+  // enough that one side's WebRTC handshake is clearly never going to land.
+  // Without the fallback a single failed peer connection hangs the match on
+  // "connecting" with no timeout and no way out but leaving.
+  const bothReady = Boolean(room.player1_ready && room.player2_ready);
+  const handshakeStalled = room.created_at < now - AUTO_START_MS;
+  if (room.status === "matched" && !room.starts_at && (bothReady || handshakeStalled)) {
     await db
-      .prepare("UPDATE rooms SET starts_at = ?, status = 'countdown', updated_at = ? WHERE id = ? AND starts_at IS NULL")
-      .bind(startsAt, Date.now(), room.id)
+      .prepare(`UPDATE rooms SET starts_at = ?, status = 'countdown', updated_at = ?
+        WHERE id = ? AND starts_at IS NULL AND status = 'matched'`)
+      .bind(now + COUNTDOWN_MS, now, room.id)
       .run();
     room = (await getRoom(room.id)) ?? room;
   }
@@ -436,15 +539,16 @@ export async function POST(request: Request) {
       const name = cleanName(payload.name);
       const startingRating = 1200;
       const previousQueue = await db
-        .prepare(`SELECT q.room_id, r.status
+        .prepare(`SELECT q.room_id, r.status, r.rated
           FROM match_queue q
           LEFT JOIN rooms r ON r.id = q.room_id
           WHERE q.player_id = ?`)
         .bind(playerId)
-        .first<{ room_id: string | null; status: string | null }>();
+        .first<{ room_id: string | null; status: string | null; rated: number | null }>();
       if (
         previousQueue?.room_id &&
         previousQueue.status &&
+        !previousQueue.rated &&
         !["complete", "abandoned"].includes(previousQueue.status)
       ) {
         return response(await pollRoom(playerId, previousQueue.room_id, 0));
@@ -452,7 +556,17 @@ export async function POST(request: Request) {
 
       await db.batch([
         db.prepare("DELETE FROM signals WHERE created_at < ?").bind(now - 10 * 60_000),
-        db.prepare("DELETE FROM match_queue WHERE last_seen < ? AND room_id IS NULL").bind(now - 60_000),
+        db.prepare("DELETE FROM match_queue WHERE last_seen < ? AND room_id IS NULL").bind(now - PRESENCE_TTL_MS),
+        // Queue rows used to outlive their match forever, so `match_queue` grew
+        // without bound. Sweep the ones whose room has been finished a while.
+        db
+          .prepare(`DELETE FROM match_queue WHERE room_id IN (
+            SELECT id FROM rooms WHERE status IN ${FINISHED_ROOM_STATUSES} AND updated_at < ?
+          )`)
+          .bind(now - 5 * 60_000),
+        db
+          .prepare(`DELETE FROM rooms WHERE status IN ${FINISHED_ROOM_STATUSES} AND updated_at < ?`)
+          .bind(now - ROOM_TTL_MS),
         db.prepare("DELETE FROM match_queue WHERE player_id = ?").bind(playerId),
         db.prepare(`INSERT INTO players (id, name, rating, wins, losses, created_at, updated_at)
           VALUES (?, ?, ?, 0, 0, ?, ?)
@@ -484,44 +598,8 @@ export async function POST(request: Request) {
         return response(await pollRoom(playerId, existing.room_id, 0));
       }
 
-      const roomId = crypto.randomUUID();
-      const candidate = await db
-        .prepare(`UPDATE match_queue
-          SET room_id = ?, last_seen = ?
-          WHERE player_id = (
-            SELECT player_id FROM match_queue
-            WHERE room_id IS NULL AND player_id <> ? AND last_seen > ?
-            ORDER BY joined_at ASC LIMIT 1
-          ) AND room_id IS NULL
-          RETURNING player_id, name, rating`)
-        .bind(roomId, now, playerId, now - 60_000)
-        .first<{ player_id: string; name: string; rating: number }>();
-
-      if (!candidate) return response({ state: "waiting" });
-
-      const ownClaim = await db
-        .prepare("UPDATE match_queue SET room_id = ?, last_seen = ? WHERE player_id = ? AND room_id IS NULL")
-        .bind(roomId, now, playerId)
-        .run();
-      if (!ownClaim.meta?.changes) {
-        await db.prepare("UPDATE match_queue SET room_id = NULL WHERE player_id = ? AND room_id = ?").bind(candidate.player_id, roomId).run();
-        return response(await pollRoom(playerId, null, 0));
-      }
-
-      await db
-        .prepare(`INSERT INTO rooms (
-          id, player1_id, player2_id, prompt_index, status, player1_ready, player2_ready,
-          starts_at, player1_score, player2_score, rated, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, 'matched', 0, 0, NULL, NULL, NULL, 0, ?, ?)`)
-        .bind(
-          roomId,
-          candidate.player_id,
-          playerId,
-          crypto.getRandomValues(new Uint32Array(1))[0] % barkPrompts.length,
-          now,
-          now,
-        )
-        .run();
+      const roomId = await pairWaitingPlayer(playerId);
+      if (!roomId) return response({ state: "waiting" });
       return response(await pollRoom(playerId, roomId, 0));
     }
 
@@ -532,25 +610,34 @@ export async function POST(request: Request) {
       return response({ error: "Room not found." }, 404);
     }
     const isPlayer1 = room.player1_id === playerId;
+    // Signalling and scoring are proof of life too. Presence used to be driven
+    // solely by the GET poll, so a player whose poll was briefly throttled had
+    // their live match abandoned out from under them.
+    await db.prepare("UPDATE match_queue SET last_seen = ? WHERE player_id = ?").bind(now, playerId).run();
 
     if (action === "signal") {
       const serialized = JSON.stringify(payload.signal ?? null);
       if (serialized.length > 80_000) return response({ error: "Signal too large." }, 413);
       const recipientId = isPlayer1 ? room.player2_id : room.player1_id;
       const result = await db
-        .prepare("INSERT INTO signals (room_id, sender_id, recipient_id, payload, created_at) VALUES (?, ?, ?, ?, ?)")
-        .bind(roomId, playerId, recipientId, serialized, now)
+        .prepare(`INSERT INTO signals (room_id, sender_id, recipient_id, payload, created_at)
+          SELECT ?, ?, ?, ?, ?
+          WHERE EXISTS (SELECT 1 FROM rooms WHERE id = ? AND status IN ${LIVE_ROOM_STATUSES})`)
+        .bind(roomId, playerId, recipientId, serialized, now, roomId)
         .run();
-      return response({ ok: result.success });
+      return response({ ok: Boolean(result.meta?.changes) });
     }
 
     if (action === "connected" || action === "ready") {
       const field = isPlayer1 ? "player1_ready" : "player2_ready";
-      await db
-        .prepare(`UPDATE rooms SET ${field} = 1, updated_at = ? WHERE id = ? AND status = 'matched'`)
+      // 'countdown' is accepted so a retried report is idempotent rather than
+      // being silently swallowed while the client believes it was recorded.
+      const result = await db
+        .prepare(`UPDATE rooms SET ${field} = 1, updated_at = ?
+          WHERE id = ? AND status IN ('matched', 'countdown')`)
         .bind(now, roomId)
         .run();
-      return response({ ok: true });
+      return response({ ok: Boolean(result.meta?.changes), status: room.status });
     }
 
     if (action === "score") {
@@ -558,10 +645,25 @@ export async function POST(request: Request) {
       if (!features) return response({ error: "Invalid audio features." }, 400);
       const score = scoreBark(features, room.prompt_index);
       const field = isPlayer1 ? "player1_score" : "player2_score";
-      await db
-        .prepare(`UPDATE rooms SET ${field} = COALESCE(${field}, ?), status = 'judging', updated_at = ? WHERE id = ?`)
-        .bind(JSON.stringify(score), now, roomId)
+      // A score only counts for a round that actually started, that has not
+      // been rated, and that this player has not already scored. Previously any
+      // client could POST perfect features the instant it was matched and take
+      // the Elo without ever barking -- and a late duplicate could drag a
+      // finished room back to 'judging'.
+      const result = await db
+        .prepare(`UPDATE rooms SET ${field} = ?, status = 'judging', updated_at = ?
+          WHERE id = ?
+            AND rated = 0
+            AND ${field} IS NULL
+            AND status IN ('countdown', 'judging')
+            AND starts_at IS NOT NULL
+            AND starts_at <= ?
+            AND starts_at > ?`)
+        .bind(JSON.stringify(score), now, roomId, now, now - SCORE_WINDOW_MS)
         .run();
+      if (!result.meta?.changes) {
+        return response({ error: "That round is no longer accepting a score." }, 409);
+      }
       return response({ ok: true });
     }
 

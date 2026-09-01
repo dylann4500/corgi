@@ -1418,6 +1418,9 @@ footer b { color: var(--orange); }
   .name-field { margin-right: auto; margin-left: auto; text-align: left; }
   .hero-actions { justify-content: center; }
   .arena-preview { width: min(620px, 100%); margin: 0 auto; }
+  /* The ribbon is a nowrap ticker on desktop; on a phone the event name
+     needs to wrap instead of being clipped off both edges. */
+  .hackathon-ribbon { white-space: normal; word-spacing: 8px; letter-spacing: 1.5px; line-height: 1.7; padding: 12px 22px; }
   .how-it-works { grid-template-columns: 1fr; }
   .how-it-works > div { padding-top: 15px; border-top: 1px solid rgba(23,23,23,.2); }
   .prompt-card { grid-template-columns: auto 1fr; }
